@@ -269,6 +269,10 @@ nav.tabs button[aria-current=page] svg{transform:translateY(-1px) scale(1.06);fi
   -webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);border:1px solid var(--line2);color:var(--ink);padding:12px 18px;border-radius:999px;font-size:15px;font-weight:600;
   opacity:0;pointer-events:none;transition:opacity .25s,transform .35s var(--ease-out);z-index:40;max-width:calc(100% - 32px);text-align:center;box-shadow:0 12px 30px rgba(0,0,0,.5)}
 .toast.show{opacity:1;transform:translate(-50%,0) scale(1)}
+.sync-status{font-size:13px;font-weight:600;margin:10px 0 0;color:var(--muted)}
+.sync-status.ok{color:var(--c-weight)}
+.sync-status.err{color:var(--danger)}
+.sync-fields{display:flex;flex-direction:column;gap:12px;margin-bottom:12px}
 .footer-note{font-size:13px;color:var(--faint);text-align:center;margin:18px 0 6px}
 
 /* ===== Food database ===== */
@@ -906,6 +910,22 @@ select{padding-right:42px;
       </div>
       <p class="muted small" id="dataStats" style="margin:12px 0 0"></p>
     </div>
+    <div class="card" id="syncCard">
+      <h2>Google Sheet sync</h2>
+      <p class="muted small" style="margin:-4px 0 12px">Optional. After you paste the Web app URL and token from the one-time setup, this phone and your Google Sheet stay in sync.</p>
+      <div class="sync-fields">
+        <div class="field" style="margin-bottom:0">
+          <label for="syncUrl">Web app URL</label>
+          <input type="url" id="syncUrl" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://script.google.com/macros/s/…/exec">
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="syncToken">Token</label>
+          <input type="password" id="syncToken" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste the token from setup">
+        </div>
+      </div>
+      <button class="btn btn-secondary" id="syncNowBtn" type="button" style="width:100%">Sync now</button>
+      <p class="sync-status" id="syncStatus" role="status"></p>
+    </div>
     <form class="card" id="clearForm" novalidate>
       <h2>Clear all data</h2>
       <p class="muted small" style="margin:-4px 0 12px">Permanently removes every entry and setting from this device. Export first if you want a copy.</p>
@@ -915,7 +935,7 @@ select{padding-right:42px;
       </div>
       <button class="btn btn-danger" type="submit" id="clearBtn" style="width:100%" disabled>Delete everything</button>
     </form>
-    <p class="footer-note">Health Tracker · works offline · no account, no tracking</p>
+    <p class="footer-note">Health Tracker · works offline · optional Google Sheet sync</p>
   </div>
 </div>
 
@@ -1431,8 +1451,243 @@ select{padding-right:42px;
   EX_LIB.forEach(function (g) { g[1].forEach(function (e) { LIB[e[0].toLowerCase()] = { name: e[0], kind: e[1], group: g[0] }; }); });
 
 
+/* Health Tracker sheet-sync helpers.
+   Shared by the app (copied into index.html), Code.gs, and node tests.
+   Keep the three copies in sync if you change merge or record packing.
+   ES5, no DOM, no Apps Script globals. */
+(function (root) {
+  'use strict';
+
+  var SYNC_COLLECTIONS = [
+    'food', 'workouts', 'water', 'bp', 'sleep', 'records', 'weights',
+    'recipes', 'stats', 'customExercises', 'recentFoods', 'favorites', 'settings'
+  ];
+
+  var LIST_COLLECTIONS = [
+    'food', 'workouts', 'water', 'bp', 'sleep', 'records', 'weights',
+    'recipes', 'stats', 'customExercises', 'recentFoods', 'favorites'
+  ];
+
+  function isISODate(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
+
+  function isoFromMs(ms) {
+    var n = Number(ms);
+    if (!isFinite(n) || n <= 0) return null;
+    // Guard obviously-broken values (pre-2000 or non-ms accidental seconds).
+    if (n < 946684800000) return null;
+    try { return new Date(n).toISOString(); } catch (e) { return null; }
+  }
+
+  function nowISO() { return new Date().toISOString(); }
+
+  function parseTime(s) {
+    if (typeof s !== 'string' || !s) return 0;
+    var t = Date.parse(s);
+    return isFinite(t) ? t : 0;
+  }
+
+  function recordId(collection, item) {
+    if (collection === 'settings') return 'settings';
+    if (!item || typeof item !== 'object') return '';
+    if (collection === 'recentFoods') return item.key ? 'recent:' + item.key : '';
+    if (collection === 'favorites') return item.key ? 'fav:' + item.key : '';
+    if (collection === 'customExercises') {
+      if (item.id && String(item.id).indexOf('custom:') === 0) return String(item.id);
+      return item.name ? 'custom:' + String(item.name).trim().toLowerCase() : '';
+    }
+    return typeof item.id === 'string' && item.id ? item.id : '';
+  }
+
+  function recordDate(collection, item) {
+    if (!item || typeof item !== 'object') return '';
+    if (isISODate(item.date)) return item.date;
+    return '';
+  }
+
+  function itemUpdatedAt(item, fallbackDate) {
+    if (!item || typeof item !== 'object') return fallbackDate ? fallbackDate + 'T00:00:00.000Z' : '1970-01-01T00:00:00.000Z';
+    if (typeof item.updatedAt === 'string' && parseTime(item.updatedAt)) return new Date(parseTime(item.updatedAt)).toISOString();
+    var fromMs = isoFromMs(item.updated) || isoFromMs(item.created) || isoFromMs(item.lastUsed) || isoFromMs(item.addedAt);
+    if (fromMs) return fromMs;
+    if (isISODate(item.date)) return item.date + 'T00:00:00.000Z';
+    return '1970-01-01T00:00:00.000Z';
+  }
+
+  function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+  function ensureRecordMeta(db) {
+    if (!db || typeof db !== 'object') return db;
+    LIST_COLLECTIONS.forEach(function (col) {
+      if (!Array.isArray(db[col])) db[col] = [];
+      db[col].forEach(function (item) {
+        if (!item || typeof item !== 'object') return;
+        var id = recordId(col, item);
+        if (col === 'customExercises' && id) item.id = id;
+        if ((col !== 'recentFoods' && col !== 'favorites' && col !== 'customExercises') || col === 'customExercises') {
+          if (!item.id && id) item.id = id;
+          if ((col === 'food' || col === 'workouts' || col === 'water' || col === 'bp' || col === 'sleep' || col === 'records' || col === 'weights' || col === 'recipes' || col === 'stats') && !item.id) {
+            item.id = 'migrated-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+          }
+        }
+        item.updatedAt = itemUpdatedAt(item);
+      });
+    });
+    if (!db.settings || typeof db.settings !== 'object') db.settings = {};
+    db.settings.updatedAt = itemUpdatedAt(db.settings);
+    if (!Array.isArray(db.tombstones)) db.tombstones = [];
+    db.tombstones = db.tombstones.filter(function (t) {
+      return t && typeof t === 'object' && typeof t.id === 'string' && t.id && typeof t.collection === 'string' && SYNC_COLLECTIONS.indexOf(t.collection) >= 0;
+    }).map(function (t) {
+      return { id: t.id, collection: t.collection, date: isISODate(t.date) ? t.date : '', updatedAt: itemUpdatedAt(t), deleted: true };
+    });
+    return db;
+  }
+
+  function dbToRecords(db) {
+    ensureRecordMeta(db);
+    var recs = [];
+    LIST_COLLECTIONS.forEach(function (col) {
+      (db[col] || []).forEach(function (item) {
+        var id = recordId(col, item);
+        if (!id) return;
+        recs.push({
+          id: id,
+          collection: col,
+          date: recordDate(col, item),
+          updatedAt: itemUpdatedAt(item),
+          deleted: false,
+          data: clone(item)
+        });
+      });
+    });
+    recs.push({
+      id: 'settings',
+      collection: 'settings',
+      date: '',
+      updatedAt: itemUpdatedAt(db.settings),
+      deleted: false,
+      data: clone(db.settings)
+    });
+    (db.tombstones || []).forEach(function (t) {
+      recs.push({
+        id: t.id,
+        collection: t.collection,
+        date: t.date || '',
+        updatedAt: t.updatedAt,
+        deleted: true,
+        data: null
+      });
+    });
+    return recs;
+  }
+
+  function cmpUpdated(a, b) {
+    return parseTime(a) - parseTime(b);
+  }
+
+  function mergeRecords(a, b) {
+    var map = {};
+    function keyOf(r) { return r.collection + '\0' + r.id; }
+    function consider(r) {
+      if (!r || typeof r !== 'object' || !r.id || !r.collection) return;
+      if (SYNC_COLLECTIONS.indexOf(r.collection) < 0) return;
+      var rec = {
+        id: String(r.id),
+        collection: r.collection,
+        date: isISODate(r.date) ? r.date : '',
+        updatedAt: typeof r.updatedAt === 'string' && r.updatedAt ? r.updatedAt : '1970-01-01T00:00:00.000Z',
+        deleted: !!r.deleted,
+        data: r.deleted ? null : (r.data != null ? r.data : r.json != null ? r.json : null)
+      };
+      if (typeof rec.data === 'string') {
+        try { rec.data = JSON.parse(rec.data); } catch (e) { rec.data = null; }
+      }
+      var k = keyOf(rec);
+      var prev = map[k];
+      if (!prev) { map[k] = rec; return; }
+      var cmp = cmpUpdated(rec.updatedAt, prev.updatedAt);
+      if (cmp > 0) { map[k] = rec; return; }
+      if (cmp < 0) return;
+      // Equal timestamps: a delete wins so removals are not resurrected.
+      if (rec.deleted && !prev.deleted) { map[k] = rec; return; }
+      if (prev.deleted && !rec.deleted) return;
+      // Still tied: keep the lexicographically larger payload for determinism.
+      var sa = JSON.stringify(rec.data);
+      var sb = JSON.stringify(prev.data);
+      if (sa > sb) map[k] = rec;
+    }
+    (a || []).forEach(consider);
+    (b || []).forEach(consider);
+    return Object.keys(map).map(function (k) { return map[k]; }).sort(function (x, y) {
+      if (x.collection !== y.collection) return x.collection < y.collection ? -1 : 1;
+      if (x.date !== y.date) return x.date < y.date ? -1 : 1;
+      return x.id < y.id ? -1 : x.id > y.id ? 1 : 0;
+    });
+  }
+
+  function blankState() {
+    return {
+      version: 1,
+      settings: { waterGoal: 64, units: 'lb' },
+      food: [], workouts: [], water: [], bp: [], sleep: [],
+      recentFoods: [], favorites: [], customExercises: [],
+      records: [], stats: [], recipes: [], weights: [],
+      tombstones: []
+    };
+  }
+
+  function recordsToState(records) {
+    var state = blankState();
+    var tombstones = [];
+    (records || []).forEach(function (r) {
+      if (!r || !r.id || !r.collection) return;
+      if (r.deleted) {
+        tombstones.push({ id: r.id, collection: r.collection, date: r.date || '', updatedAt: r.updatedAt, deleted: true });
+        return;
+      }
+      if (r.collection === 'settings') {
+        if (r.data && typeof r.data === 'object') state.settings = clone(r.data);
+        return;
+      }
+      if (LIST_COLLECTIONS.indexOf(r.collection) < 0) return;
+      if (r.data && typeof r.data === 'object') state[r.collection].push(clone(r.data));
+    });
+    state.tombstones = tombstones;
+    ensureRecordMeta(state);
+    return state;
+  }
+
+  // Apply merged records onto an existing state (keeps version and any non-synced fields).
+  function applyRecords(state, records) {
+    var next = recordsToState(records);
+    if (!state || typeof state !== 'object') return next;
+    next.version = state.version || 1;
+    return next;
+  }
+
+  var api = {
+    SYNC_COLLECTIONS: SYNC_COLLECTIONS,
+    LIST_COLLECTIONS: LIST_COLLECTIONS,
+    nowISO: nowISO,
+    isoFromMs: isoFromMs,
+    recordId: recordId,
+    itemUpdatedAt: itemUpdatedAt,
+    ensureRecordMeta: ensureRecordMeta,
+    dbToRecords: dbToRecords,
+    mergeRecords: mergeRecords,
+    recordsToState: recordsToState,
+    applyRecords: applyRecords,
+    blankState: blankState,
+    parseTime: parseTime
+  };
+
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+  root.HTSync = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+
   function blank() {
-    return { version: 1, settings: { waterGoal: DEFAULT_GOAL, units: 'lb' }, food: [], workouts: [], water: [], bp: [], sleep: [], recentFoods: [], favorites: [], customExercises: [], records: [], stats: [], recipes: [], weights: [] };
+    return { version: 1, settings: { waterGoal: DEFAULT_GOAL, units: 'lb' }, food: [], workouts: [], water: [], bp: [], sleep: [], recentFoods: [], favorites: [], customExercises: [], records: [], stats: [], recipes: [], weights: [], tombstones: [] };
   }
   function validFood(f) {
     if (!f || typeof f !== 'object' || typeof f.key !== 'string' || typeof f.name !== 'string') return false;
@@ -1467,6 +1722,9 @@ select{padding-right:42px;
     out.records = out.records.map(normRecord).filter(Boolean);
     out.stats = Array.isArray(o.stats) ? o.stats.map(normStat).filter(Boolean) : [];
     out.recipes = Array.isArray(o.recipes) ? o.recipes.map(normRecipe).filter(Boolean) : [];
+    if (o.settings && typeof o.settings.updatedAt === 'string') out.settings.updatedAt = o.settings.updatedAt;
+    out.tombstones = Array.isArray(o.tombstones) ? o.tombstones : [];
+    HTSync.ensureRecordMeta(out);
     return out;
   }
   function load() {
@@ -1481,8 +1739,13 @@ select{padding-right:42px;
       return blank();
     }
   }
-  function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(db)); return true; }
+  function save(opts) {
+    try {
+      HTSync.ensureRecordMeta(db);
+      localStorage.setItem(KEY, JSON.stringify(db));
+      if (!opts || opts.sync !== false) scheduleSync();
+      return true;
+    }
     catch (e) { toast('Could not save. Storage may be full.'); return false; }
   }
   var db = load();
@@ -1865,12 +2128,24 @@ select{padding-right:42px;
 
   /* ---------- Adding entries ---------- */
   function add(list, entry) {
-    entry.id = uid(); entry.created = Date.now();
+    entry.id = uid(); entry.created = Date.now(); entry.updatedAt = HTSync.nowISO();
     db[list].push(entry);
     if (save()) return true;
     db[list].pop();
     return false;
   }
+  function tombstone(collection, id, date) {
+    if (!id) return;
+    db.tombstones = (db.tombstones || []).filter(function (t) { return !(t.collection === collection && t.id === id); });
+    db.tombstones.push({ id: id, collection: collection, date: date || '', updatedAt: HTSync.nowISO(), deleted: true });
+  }
+  function removeById(list, id) {
+    var item = (db[list] || []).filter(function (x) { return x.id === id; })[0];
+    var syncId = item ? (HTSync.recordId(list, item) || id) : id;
+    db[list] = (db[list] || []).filter(function (x) { return x.id !== id; });
+    tombstone(list, syncId, item && item.date);
+  }
+  function touchSettings() { db.settings.updatedAt = HTSync.nowISO(); }
   function err(id, msg) { $(id).textContent = msg || ''; }
   function defaultMeal() {
     var d = new Date(), h = d.getHours() + d.getMinutes() / 60;
@@ -1934,6 +2209,7 @@ select{padding-right:42px;
     var g = Number(v);
     if (String(v).trim() === '' || !isFinite(g) || g < 8 || g > 300) { toast('Goal should be between 8 and 300 oz'); return; }
     db.settings.waterGoal = Math.round(g);
+    touchSettings();
     if (save()) { blurActive(); toast('Daily goal set to ' + db.settings.waterGoal + ' oz'); render(); }
   }
   $('goalForm').addEventListener('submit', function (e) { e.preventDefault(); setGoal($('goalInput').value); });
@@ -1969,6 +2245,7 @@ select{padding-right:42px;
     proceed.then(function (ok) {
       if (!ok) return;
       var backup = db.sleep;
+      db.sleep.filter(function (x) { return x.date === date; }).forEach(function (x) { tombstone('sleep', x.id, x.date); });
       db.sleep = db.sleep.filter(function (x) { return x.date !== date; });
       if (add('sleep', { date: date, bed: bed, wake: wake, minutes: mins, quality: sleepQuality, notes: $('sleepNotes').value.trim() })) {
         $('sleepBed').value = ''; $('sleepWake').value = ''; $('sleepNotes').value = ''; $('sleepDate').value = todayKey();
@@ -2000,7 +2277,7 @@ select{padding-right:42px;
     if (LISTS.indexOf(list) < 0) return;
     confirmBox('Delete this entry?', 'It will be removed from this device. This can\u2019t be undone.', 'Delete', true).then(function (ok) {
       if (!ok) return;
-      db[list] = db[list].filter(function (x) { return x.id !== id; });
+      removeById(list, id);
       if (save()) { toast('Deleted'); render(); }
     });
   });
@@ -2026,6 +2303,7 @@ select{padding-right:42px;
   $('openSettings').addEventListener('click', function () {
     $('settingsGoal').value = db.settings.waterGoal; $('clearConfirm').value = ''; $('clearBtn').disabled = true;
     checkRadio('unitPref', units());
+    paintSyncForm();
     dataStats(); openOverlay($('settingsOverlay'));
   });
   $('closeSettings').addEventListener('click', closeSettings);
@@ -2143,7 +2421,7 @@ select{padding-right:42px;
     }
     resetTimes(); render();
   }
-  document.addEventListener('visibilitychange', function () { if (!document.hidden) refresh(); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { refresh(); scheduleSync(); } });
   setInterval(function () { if (!document.hidden && current === 'today') refresh(); }, 60000);
 
 
@@ -2324,13 +2602,13 @@ select{padding-right:42px;
   /* ---------- Recent + favorites (stored in db, exported with everything else) ---------- */
   function isFav(key) { return db.favorites.some(function (f) { return f.key === key; }); }
   function toggleFav(food) {
-    if (isFav(food.key)) db.favorites = db.favorites.filter(function (f) { return f.key !== food.key; });
-    else db.favorites.unshift(Object.assign(snapshot(food), { addedAt: Date.now() }));
+    if (isFav(food.key)) { db.favorites = db.favorites.filter(function (f) { return f.key !== food.key; }); tombstone('favorites', 'fav:' + food.key, ''); }
+    else db.favorites.unshift(Object.assign(snapshot(food), { addedAt: Date.now(), updatedAt: HTSync.nowISO() }));
     save();
     return isFav(food.key);
   }
   function touchRecent(food, optLabel, qty) {
-    var snap = Object.assign(snapshot(food), { lastOpt: optLabel, lastQty: qty, lastUsed: Date.now() });
+    var snap = Object.assign(snapshot(food), { lastOpt: optLabel, lastQty: qty, lastUsed: Date.now(), updatedAt: HTSync.nowISO() });
     db.recentFoods = [snap].concat(db.recentFoods.filter(function (f) { return f.key !== food.key; })).slice(0, MAX_RECENTS);
     // keep favorite copy fresh (e.g. serving sizes loaded later)
     db.favorites = db.favorites.map(function (f) { return f.key === food.key ? Object.assign(snapshot(food), { addedAt: f.addedAt }) : f; });
@@ -2967,7 +3245,7 @@ select{padding-right:42px;
     if (!rb.ings.length) { err('rbErr', 'Add at least one ingredient.'); return; }
     err('rbErr');
     var now = Date.now(), old = rb.id ? recipeById(rb.id) : null;
-    var r = { id: rb.id || uid(), name: name.slice(0, 80), servings: s, cookedG: cg || null, ings: rb.ings, notes: rb.notes || '', created: old ? old.created : now, updated: now };
+    var r = { id: rb.id || uid(), name: name.slice(0, 80), servings: s, cookedG: cg || null, ings: rb.ings, notes: rb.notes || '', created: old ? old.created : now, updated: now, updatedAt: HTSync.nowISO() };
     var before = db.recipes.slice();
     if (old) db.recipes = db.recipes.map(function (x) { return x.id === r.id ? r : x; }); else db.recipes.push(r);
     syncRecipeCopies(r);
@@ -2979,7 +3257,7 @@ select{padding-right:42px;
   $('rbDup').addEventListener('click', function () {
     var src = rb && rb.id ? recipeById(rb.id) : null; if (!src) return;
     var now = Date.now(), copy = JSON.parse(JSON.stringify(src));
-    copy.id = uid(); copy.name = (src.name + ' (copy)').slice(0, 80); copy.created = now; copy.updated = now;
+    copy.id = uid(); copy.name = (src.name + ' (copy)').slice(0, 80); copy.created = now; copy.updated = now; copy.updatedAt = HTSync.nowISO();
     db.recipes.push(copy);
     if (!save()) { db.recipes.pop(); return; }
     closeBuilder(true); openBuilder(copy); toast('Recipe duplicated'); render();
@@ -2988,9 +3266,11 @@ select{padding-right:42px;
     var id = rb && rb.id; if (!id) return;
     confirmBox('Delete this recipe?', 'Meals you already logged from it stay in your log.', 'Delete', true).then(function (ok) {
       if (!ok) return;
-      db.recipes = db.recipes.filter(function (x) { return x.id !== id; });
+      removeById('recipes', id);
       db.favorites = db.favorites.filter(function (f) { return f.key !== 'recipe:' + id; });
       db.recentFoods = db.recentFoods.filter(function (f) { return f.key !== 'recipe:' + id; });
+      tombstone('favorites', 'fav:recipe:' + id, '');
+      tombstone('recentFoods', 'recent:recipe:' + id, '');
       if (save()) { closeBuilder(true); toast('Recipe deleted'); render(); }
     });
   });
@@ -3141,7 +3421,7 @@ select{padding-right:42px;
   function updateEntry(list, id, patch) {
     var i = db[list].findIndex(function (x) { return x.id === id; }); if (i < 0) { toast('That entry was deleted.'); return false; }
     var backup = db[list][i];
-    db[list][i] = Object.assign({}, backup, patch, { updated: Date.now() });
+    db[list][i] = Object.assign({}, backup, patch, { updated: Date.now(), updatedAt: HTSync.nowISO() });
     if (!save()) { db[list][i] = backup; return false; }
     return true;
   }
@@ -3181,6 +3461,7 @@ select{padding-right:42px;
         confirmBox('Replace this night?', 'You already logged sleep for the night before ' + fmtDate(date) + '. Replace it with this one?', 'Replace', false).then(function (ok) {
           if (!ok) return;
           var before = db.sleep;
+          db.sleep.filter(function (x) { return x.date === date && x.id !== id; }).forEach(function (x) { tombstone('sleep', x.id, x.date); });
           db.sleep = db.sleep.filter(function (x) { return !(x.date === date && x.id !== id); });
           if (updateEntry('sleep', id, patch)) { closeEntryEdit(); toast('Sleep updated'); render(); } else db.sleep = before;
         });
@@ -3194,7 +3475,7 @@ select{padding-right:42px;
     if (!ee) return; var list = ee.list, id = ee.id;
     confirmBox('Delete this entry?', 'It will be removed from this device. This can\u2019t be undone.', 'Delete', true).then(function (ok) {
       if (!ok) return;
-      db[list] = db[list].filter(function (x) { return x.id !== id; });
+      removeById(list, id);
       if (save()) { closeEntryEdit(); toast('Deleted'); render(); if ($('wtOverlay').classList.contains('open')) renderWeight(); }
     });
   });
@@ -3263,7 +3544,7 @@ select{padding-right:42px;
     var id = sheet.editId; if (!id) return;
     confirmBox('Delete this entry?', 'It will be removed from this device. This can\u2019t be undone.', 'Delete', true).then(function (ok) {
       if (!ok) return;
-      db.food = db.food.filter(function (x) { return x.id !== id; });
+      removeById('food', id);
       if (save()) { closeFoodSheet(); toast('Deleted'); render(); }
     });
   });
@@ -3437,15 +3718,16 @@ select{padding-right:42px;
     var v = numVal('wtGoal'), u = units(), lim = u === 'kg' ? [20, 350] : [45, 770];
     if (v === null || isNaN(v) || v < lim[0] || v > lim[1]) { toast('Goal should be ' + lim[0] + ' to ' + lim[1] + ' ' + u); return; }
     db.settings.weightGoal = { value: r1(v), unit: u };
+    touchSettings();
     if (save()) { blurActive(); toast('Goal set to ' + fmtG(r1(v)) + ' ' + u); renderWeight(); }
   });
-  $('wtGoalClear').addEventListener('click', function () { db.settings.weightGoal = null; if (save()) { $('wtGoal').value = ''; toast('Goal cleared'); renderWeight(); } });
+  $('wtGoalClear').addEventListener('click', function () { db.settings.weightGoal = null; touchSettings(); if (save()) { $('wtGoal').value = ''; toast('Goal cleared'); renderWeight(); } });
   $('wtList').addEventListener('click', function (e) {
     var d = e.target.closest('[data-wdel]');
     if (d) {
       var id = d.dataset.wdel;
       confirmBox('Delete this weigh-in?', 'It will be removed from this device. This can\u2019t be undone.', 'Delete', true).then(function (ok) {
-        if (!ok) return; db.weights = db.weights.filter(function (x) { return x.id !== id; }); if (save()) { toast('Deleted'); renderWeight(); }
+        if (!ok) return; removeById('weights', id); if (save()) { toast('Deleted'); renderWeight(); }
       });
       return;
     }
@@ -3721,7 +4003,7 @@ select{padding-right:42px;
     (Array.isArray(list) ? list : []).forEach(function (c) {
       if (!c || typeof c.name !== 'string' || !c.name.trim()) return;
       var k = c.name.trim().toLowerCase(); if (seen[k] || LIB[k]) return;
-      seen[k] = 1; out.push({ name: c.name.trim().slice(0, 80), kind: kindOk(c.kind) });
+      seen[k] = 1; out.push({ name: c.name.trim().slice(0, 80), kind: kindOk(c.kind), id: (c.id && String(c.id).indexOf('custom:') === 0) ? c.id : ('custom:' + k), updatedAt: c.updatedAt || HTSync.nowISO() });
     });
     return out.slice(0, 300);
   }
@@ -4066,7 +4348,7 @@ select{padding-right:42px;
       var idx = -1; db.workouts.forEach(function (w, k) { if (w.id === ed.id) idx = k; });
       if (idx < 0) { err('woErr', 'This workout was deleted. Close and start again.'); return; }
       var backup = db.workouts[idx];
-      db.workouts[idx] = Object.assign({}, backup, entry);
+      db.workouts[idx] = Object.assign({}, backup, entry, { updated: Date.now(), updatedAt: HTSync.nowISO() });
       ok = save(); if (!ok) db.workouts[idx] = backup;
     } else {
       ok = add('workouts', entry);
@@ -4084,7 +4366,8 @@ select{padding-right:42px;
     exercises.forEach(function (ex) {
       var k = ex.name.toLowerCase(); if (LIB[k]) return;
       var found = list.filter(function (c) { return c.name.toLowerCase() === k; })[0];
-      if (found) found.kind = ex.kind; else list.unshift({ name: ex.name, kind: ex.kind });
+      if (found) { found.kind = ex.kind; found.updatedAt = HTSync.nowISO(); if (!found.id) found.id = 'custom:' + k; }
+      else list.unshift({ name: ex.name, kind: ex.kind, id: 'custom:' + k, updatedAt: HTSync.nowISO() });
     });
     db.customExercises = cleanCustom(list);
   }
@@ -4094,7 +4377,7 @@ select{padding-right:42px;
     confirmBox('Delete this workout?', 'It will be removed from this device. This can\u2019t be undone.', 'Delete', true).then(function (ok) {
       if (!ok) return;
       var before = db.workouts;
-      db.workouts = db.workouts.filter(function (w) { return w.id !== id; });
+      removeById('workouts', id);
       if (save()) { closeWorkout(true); toast('Deleted'); render(); } else db.workouts = before;
     });
   });
@@ -4312,6 +4595,7 @@ select{padding-right:42px;
   document.querySelectorAll('input[name="unitPref"]').forEach(function (r) {
     r.addEventListener('change', function () {
       db.settings.units = r.value === 'kg' ? 'kg' : 'lb';
+      touchSettings();
       if (save()) toast(db.settings.units === 'kg' ? 'Using kilograms and kilometers' : 'Using pounds and miles');
     });
   });
@@ -4684,7 +4968,7 @@ select{padding-right:42px;
     var ok;
     if (rfEditing) {
       var i = db.records.indexOf(rfEditing), backup = rfEditing;
-      db.records[i] = Object.assign({ id: backup.id, created: backup.created }, rec);
+      db.records[i] = Object.assign({ id: backup.id, created: backup.created, updatedAt: HTSync.nowISO() }, rec);
       ok = save(); if (!ok) db.records[i] = backup;
     } else ok = add('records', rec);
     if (!ok) return;
@@ -4698,7 +4982,7 @@ select{padding-right:42px;
     confirmBox('Delete this record?', 'Only this manual record is removed. Your logged workouts aren\u2019t affected.', 'Delete', true).then(function (ok) {
       if (!ok) return;
       var before = db.records;
-      db.records = db.records.filter(function (x) { return x !== target; });
+      removeById('records', target.id);
       if (save()) { closeRecordForm(); toast('Record deleted'); if ($('recOverlay').classList.contains('open')) renderRecords(); } else db.records = before;
     });
   });
@@ -4986,6 +5270,7 @@ select{padding-right:42px;
     s.history = s.history.slice(-50);
     var latest = s.history[s.history.length - 1];
     if (date >= s.date || latest.date === date) { s.value = nv.value; s.unit = nv.unit; s.date = date; s.note = note; }
+    s.updatedAt = HTSync.nowISO();
     if (!save()) { Object.assign(s, JSON.parse(backup)); return false; }
     toast(s.name + ' set to ' + statShort(s)); renderStatDetail(); renderStats();
     $('stValue').value = s.kind === 'run' ? fmtClock(s.value) : s.value; $('stNote').value = s.note || '';
@@ -5001,7 +5286,7 @@ select{padding-right:42px;
     else { v = raw.slice(0, 40); unit = $('stUnitText').value.trim(); if (!v) { err('stErr', 'Enter a value.'); return; } }
     err('stErr');
     if (stEditing) { applyStatUpdate(stEditing, { value: v, unit: unit }, date, note); blurActive(); return; }
-    var rec = { id: uid(), created: Date.now(), kind: k, value: v, unit: unit, date: date, note: note, history: [] };
+    var rec = { id: uid(), created: Date.now(), updatedAt: HTSync.nowISO(), kind: k, value: v, unit: unit, date: date, note: note, history: [] };
     if (k === '1rm') rec.name = stNewName;
     if (k === 'other') { rec.name = $('stName').value.trim(); if (!rec.name) { err('stErr', 'Name this stat, e.g. Bodyweight.'); $('stName').focus(); return; } }
     if (k === 'run') {
@@ -5020,16 +5305,161 @@ select{padding-right:42px;
     var s = stEditing; if (!s) return;
     confirmBox('Remove ' + s.name + '?', 'Its current value and history are removed from Current stats. Your workouts and records aren\u2019t affected.', 'Remove', true).then(function (ok) {
       if (!ok) return;
-      var before = db.stats; db.stats = db.stats.filter(function (x) { return x !== s; });
+      var before = db.stats; removeById('stats', s.id);
       if (save()) { closeStat(); renderStats(); toast('Removed'); } else db.stats = before;
     });
   });
   $('stClose').addEventListener('click', closeStat);
   $('statOverlay').addEventListener('click', function (e) { if (e.target === $('statOverlay')) closeStat(); });
   // Exposed for automated tests only (no effect on normal use).
-  window.__htTest = { usdaToFood: usdaToFood, offToFood: offToFood, servingOptions: servingOptions, computeNut: computeNut, servingText: servingText, mergeResults: mergeResults, validGtin: validGtin, upcEtoA: upcEtoA, setsText: setsText, woVolume: woVolume, normWorkout: normWorkout, recordSweep: recordSweep, fmtClock: fmtClock, parseClock: parseClock, riegel: riegel, normStat: normStat, wtMA: wtMA, wtSlope: wtSlope, wtStats: wtStats, macroKcal: macroKcal, entryFood: entryFood, suggestSets: suggestSets, cleanExercise: cleanExercise, recipeFood: recipeFood, recipeTotals: recipeTotals, normRecipe: normRecipe };
+  window.__htTest = { usdaToFood: usdaToFood, offToFood: offToFood, servingOptions: servingOptions, computeNut: computeNut, servingText: servingText, mergeResults: mergeResults, validGtin: validGtin, upcEtoA: upcEtoA, setsText: setsText, woVolume: woVolume, normWorkout: normWorkout, recordSweep: recordSweep, fmtClock: fmtClock, parseClock: parseClock, riegel: riegel, normStat: normStat, wtMA: wtMA, wtSlope: wtSlope, wtStats: wtStats, macroKcal: macroKcal, entryFood: entryFood, suggestSets: suggestSets, cleanExercise: cleanExercise, recipeFood: recipeFood, recipeTotals: recipeTotals, normRecipe: normRecipe, HTSync: HTSync, tombstone: tombstone, removeById: removeById };
+
+
+  /* ---------- Google Sheet sync ---------- */
+  var SYNC_CFG_KEY = 'healthTracker.sync.v1';
+  var syncTimer = null, syncInFlight = false, syncQueued = false;
+
+  function loadSyncCfg() {
+    try {
+      var o = JSON.parse(localStorage.getItem(SYNC_CFG_KEY) || '{}');
+      if (!o || typeof o !== 'object') return { url: '', token: '', lastSyncAt: '', lastError: '', lastOk: false };
+      return {
+        url: typeof o.url === 'string' ? o.url : '',
+        token: typeof o.token === 'string' ? o.token : '',
+        lastSyncAt: typeof o.lastSyncAt === 'string' ? o.lastSyncAt : '',
+        lastError: typeof o.lastError === 'string' ? o.lastError : '',
+        lastOk: !!o.lastOk
+      };
+    } catch (e) {
+      return { url: '', token: '', lastSyncAt: '', lastError: '', lastOk: false };
+    }
+  }
+  function saveSyncCfg(cfg) {
+    try { localStorage.setItem(SYNC_CFG_KEY, JSON.stringify(cfg)); } catch (e) {}
+  }
+  function syncUrlOk(url) {
+    return /^https:\/\/script\.google\.com\/macros\/s\/[^/\s]+\/exec\/?$/.test(String(url || '').trim());
+  }
+  function relSyncTime(iso) {
+    var t = Date.parse(iso);
+    if (!isFinite(t)) return '';
+    var sec = Math.round((Date.now() - t) / 1000);
+    if (sec < 15) return 'just now';
+    if (sec < 60) return sec + 's ago';
+    if (sec < 3600) return Math.round(sec / 60) + ' min ago';
+    if (sec < 86400) return Math.round(sec / 3600) + ' hr ago';
+    return relDate(iso.slice(0, 10));
+  }
+  function paintSyncStatus() {
+    var el = $('syncStatus'); if (!el) return;
+    var cfg = loadSyncCfg();
+    el.classList.remove('ok', 'err');
+    if (!cfg.url && !cfg.token) { el.textContent = 'Not connected yet.'; return; }
+    if (!syncUrlOk(cfg.url) || !cfg.token) { el.classList.add('err'); el.textContent = 'Add both the Web app URL and the token to connect.'; return; }
+    if (syncInFlight) { el.textContent = 'Syncing…'; return; }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      el.textContent = cfg.lastSyncAt ? 'Offline. Last synced ' + relSyncTime(cfg.lastSyncAt) + '.' : 'Offline. Will sync when you are back online.';
+      return;
+    }
+    if (cfg.lastError) { el.classList.add('err'); el.textContent = cfg.lastError; return; }
+    if (cfg.lastOk && cfg.lastSyncAt) { el.classList.add('ok'); el.textContent = 'Last synced ' + relSyncTime(cfg.lastSyncAt) + '.'; return; }
+    el.textContent = 'Ready to sync.';
+  }
+  function paintSyncForm() {
+    var cfg = loadSyncCfg();
+    if ($('syncUrl')) $('syncUrl').value = cfg.url;
+    if ($('syncToken')) $('syncToken').value = cfg.token;
+    paintSyncStatus();
+  }
+  function readSyncForm() {
+    var cfg = loadSyncCfg();
+    cfg.url = ($('syncUrl') && $('syncUrl').value || '').trim();
+    cfg.token = ($('syncToken') && $('syncToken').value || '').trim();
+    saveSyncCfg(cfg);
+    return cfg;
+  }
+  function scheduleSync(immediate) {
+    var cfg = loadSyncCfg();
+    if (!syncUrlOk(cfg.url) || !cfg.token) return;
+    if (immediate) { clearTimeout(syncTimer); runSync(); return; }
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(runSync, 1500);
+  }
+  function runSync() {
+    var cfg = loadSyncCfg();
+    if (!syncUrlOk(cfg.url) || !cfg.token) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) { paintSyncStatus(); return; }
+    if (syncInFlight) { syncQueued = true; return; }
+    syncInFlight = true;
+    paintSyncStatus();
+    var payload = JSON.stringify({ token: cfg.token, records: HTSync.dbToRecords(db) });
+    fetch(cfg.url.replace(/\/+$/, ''), {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: payload,
+      redirect: 'follow'
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        var body = null;
+        try { body = JSON.parse(text); } catch (e) { body = null; }
+        if (!res.ok || !body || !body.ok) {
+          var msg = (body && body.error === 'Unauthorized')
+            ? 'Sync failed: the token was rejected. Check the token in Settings.'
+            : (body && body.error) ? ('Sync failed: ' + body.error) : ('Sync failed (' + res.status + '). Try again in a moment.');
+          throw new Error(msg);
+        }
+        return body;
+      });
+    }).then(function (body) {
+      var next = HTSync.applyRecords(db, body.records || []);
+      db = next;
+      save({ sync: false });
+      cfg = loadSyncCfg();
+      cfg.lastSyncAt = HTSync.nowISO();
+      cfg.lastError = '';
+      cfg.lastOk = true;
+      saveSyncCfg(cfg);
+      render();
+      if ($('settingsOverlay') && $('settingsOverlay').classList.contains('open')) {
+        $('settingsGoal').value = db.settings.waterGoal;
+        checkRadio('unitPref', units());
+        dataStats();
+      }
+      paintSyncStatus();
+    }).catch(function (e) {
+      cfg = loadSyncCfg();
+      var msg = (e && e.message) ? e.message : 'Sync failed. Check your connection and try again.';
+      if (/Failed to fetch|NetworkError|TypeError/i.test(msg)) msg = 'Sync failed. Check your connection and try again.';
+      cfg.lastError = msg;
+      cfg.lastOk = false;
+      saveSyncCfg(cfg);
+      paintSyncStatus();
+    }).then(function () {
+      syncInFlight = false;
+      if (syncQueued) { syncQueued = false; scheduleSync(true); }
+    });
+  }
+
+  if ($('syncUrl')) {
+    ['syncUrl', 'syncToken'].forEach(function (id) {
+      $(id).addEventListener('change', function () { readSyncForm(); paintSyncStatus(); });
+      $(id).addEventListener('blur', function () { readSyncForm(); paintSyncStatus(); });
+    });
+  }
+  if ($('syncNowBtn')) {
+    $('syncNowBtn').addEventListener('click', function () {
+      readSyncForm();
+      var cfg = loadSyncCfg();
+      if (!syncUrlOk(cfg.url) || !cfg.token) { paintSyncStatus(); toast('Paste the Web app URL and token first.'); return; }
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) { paintSyncStatus(); toast('You are offline. Sync will wait until you are back online.'); return; }
+      scheduleSync(true);
+    });
+  }
+  window.addEventListener('online', function () { paintSyncStatus(); scheduleSync(); });
+  window.addEventListener('offline', paintSyncStatus);
 
   /* Auto calories on every manual nutrition form. */
+
   attachAutoCal('foodCal', 'foodProtein', 'foodCarbs', 'foodFat');
   attachAutoCal('rbmCal', 'rbmP', 'rbmC', 'rbmF');
   attachAutoCal('fsoCal', 'fsoP', 'fsoC', 'fsoF');
@@ -5043,6 +5473,7 @@ select{padding-right:42px;
   if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
     window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); });
   }
+  scheduleSync();
 })();
 </script>
 </body>
